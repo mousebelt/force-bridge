@@ -110,7 +110,7 @@ export class MultiSigMgr {
               logger.error(
                 `MultiSigMgr collectSignatures chain:${this.chainType} address:${svrHost.address} rawData:${
                   params.rawData
-                } payload:${JSON.stringify(params.payload, null, 2)} sigServer:${svrHost.host}, error:${err.message}`,
+                } payload:${JSON.stringify(params.payload)} sigServer:${svrHost.host}, error:${err.message}`,
               );
               failedSigServerHosts.push(svrHost);
               resolve(null);
@@ -128,9 +128,6 @@ export class MultiSigMgr {
         const sigResp = promiseResult.sigResp;
         const svrHost = promiseResult.svrHost;
         if (sigResp.error) {
-          if (retryErrorCode.has(sigResp.error.code)) {
-            failedSigServerHosts.push(svrHost);
-          }
           const errorCode = sigResp.error.code;
           const errorMsg = `MultiSigMgr collectSignatures chain:${this.chainType} address:${svrHost.address} rawData:${
             params.rawData
@@ -138,11 +135,8 @@ export class MultiSigMgr {
             sigResp.error.message
           }`;
 
-          if (
-            errorCode === SigErrorTxCompleted ||
-            errorCode === SigErrorTxUnconfirmed ||
-            errorCode === SigErrorBlockSyncUncompleted
-          ) {
+          if (retryErrorCode.has(errorCode)) {
+            failedSigServerHosts.push(svrHost);
             logger.warn(errorMsg);
           } else {
             logger.error(errorMsg);
@@ -182,7 +176,7 @@ export class MultiSigMgr {
       }
       //retry failed hosts
       sigServerHosts = failedSigServerHosts;
-      await asyncSleep(3000);
+      await asyncSleep(15000);
     }
     return sigs.map((sig) => {
       return sig.signature;

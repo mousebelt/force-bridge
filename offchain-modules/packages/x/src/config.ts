@@ -40,7 +40,6 @@ export interface CkbConfig {
   privateKey: string;
   multiSignHosts: MultiSignHost[];
   multisigScript: MultisigItem;
-  multisigLockscript: Script;
   ownerCellTypescript: Script;
   deps: CkbDeps;
   startBlockHeight: number;
@@ -57,7 +56,6 @@ export interface EthConfig {
   multiSignThreshold: number;
   confirmNumber: number;
   startBlockHeight: number;
-  batchUnlock: { batchNumber: number; maxWaitTime: number };
   assetWhiteList: WhiteListEthAsset[];
 }
 
@@ -102,13 +100,33 @@ export interface BtcConfig {
   confirmNumber: number;
 }
 
-export interface rpcConfig {
-  corsOptions?: {
-    origin: string;
-    methods?: string;
-    preflightContinue?: boolean;
-    optionsSuccessStatus?: number;
+export interface AdaConfig {
+  clientParams: {
+    host: string;
+    user: string;
+    pass: string;
+    port: number;
+    timeout?: number;
   };
+  /**
+   * @deprecated migrate to {@link KeyStore}
+   */
+  lockAddress: string;
+  confirmNumber: number;
+  wallet:{
+    name:string,
+    mnemonic_sentence: string,
+    passphrase: string,
+    public_key : string
+  },
+  minimalBridgeAmount: string,
+  multiplier: number,
+  user:{
+    name:string,
+    mnemonic_sentence: string,
+    passphrase: string
+  },
+  bridgeFee: { in: string; out: string };
 }
 
 export interface logConfig {
@@ -137,7 +155,7 @@ export interface commonConfig {
   network: 'mainnet' | 'testnet';
   lumosConfigType: 'LINA' | 'AGGRON4' | 'DEV';
   port?: number;
-  orm: ormConfig;
+  orm?: ormConfig;
   openMetric: boolean;
   keystorePath?: string;
   collectorPubKeyHash: string[];
@@ -163,6 +181,15 @@ export interface collectorConfig {
   gasPriceGweiLimit: number;
 }
 
+export interface monitorConfig {
+  expiredTime: number;
+  expiredCheckInterval: number;
+  discordWebHook: string;
+  discordWebHookError?: string;
+  scanStep: number;
+  env: string;
+}
+
 export interface Config {
   common: commonConfig;
   ckb: CkbConfig;
@@ -170,6 +197,7 @@ export interface Config {
   eos: EosConfig;
   tron: TronConfig;
   btc: BtcConfig;
-  rpc?: rpcConfig;
   collector?: collectorConfig;
+  monitor?: monitorConfig;
+  ada: AdaConfig
 }

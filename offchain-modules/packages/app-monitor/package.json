@@ -1,0 +1,20 @@
+{
+  "name": "@force-bridge/app-monitor",
+  "version": "0.0.6",
+  "main": "dist",
+  "scripts": {
+    "build": "yarn run clean && yarn run compile",
+    "clean": "rimraf -rf ./dist",
+    "compile": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "yarn run build",
+    "test": "yarn run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@force-bridge/x": "^0.0.6",
+    "@force-bridge/xchain-eth": "^0.0.6",
+    "fetch-with-proxy": "^3.0.1"
+  }
+}

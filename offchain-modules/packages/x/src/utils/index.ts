@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { TransactionSkeletonObject, TransactionSkeletonType } from '@ckb-lumos/helpers';
+import { TransactionSkeletonType } from '@ckb-lumos/helpers';
 import * as utils from '@nervosnetwork/ckb-sdk-utils';
 import { AddressPrefix } from '@nervosnetwork/ckb-sdk-utils';
 import { ethers } from 'ethers';
@@ -11,17 +11,19 @@ import { ForceBridgeCore } from '../core';
 import { BtcLock } from '../db/entity/BtcLock';
 import { BtcUnlock } from '../db/entity/BtcUnlock';
 import { CkbBurn } from '../db/entity/CkbBurn';
-import { CkbMint } from '../db/entity/CkbMint';
+import { CkbMint, CollectorCkbMint } from '../db/entity/CkbMint';
 import { EosLock } from '../db/entity/EosLock';
 import { EosUnlock } from '../db/entity/EosUnlock';
 import { EthLock } from '../db/entity/EthLock';
-import { EthUnlock } from '../db/entity/EthUnlock';
+import { CollectorEthUnlock, EthUnlock } from '../db/entity/EthUnlock';
 import { SignedTx } from '../db/entity/SignedTx';
 import { TronLock } from '../db/entity/TronLock';
 import { TronUnlock } from '../db/entity/TronUnlock';
 import { WithdrawedBridgeFee } from '../db/entity/WithdrawedBridgeFee';
 import { KV } from '../db/entity/kv';
 import { nonNullable } from '../errors';
+import { AdaLock } from '../db/entity/AdaLock';
+import {AdaUnlock} from '../db/entity/AdaUnlock';
 
 export { asyncSleep, retryPromise, foreverPromise } from './promise';
 
@@ -119,29 +121,33 @@ export function privateKeyToCkbAddress(privkey: string, prefix: ckbAddressPrefix
 export async function getDBConnection(): Promise<Connection> {
   const ormCfg = ForceBridgeCore.config.common.orm;
   return createConnection({
-    type: ormCfg.type,
-    host: ormCfg.host,
-    port: ormCfg.port,
-    username: ormCfg.username,
-    password: ormCfg.password,
-    database: ormCfg.database,
-    timezone: ormCfg.timezone,
-    synchronize: ormCfg.synchronize,
-    logging: ormCfg.logging,
+    type: ormCfg!.type,
+    host: ormCfg!.host,
+    port: ormCfg!.port,
+    username: ormCfg!.username,
+    password: ormCfg!.password,
+    database: ormCfg!.database,
+    timezone: ormCfg!.timezone,
+    synchronize: ormCfg!.synchronize,
+    logging: ormCfg!.logging,
     entities: [
       BtcLock,
       BtcUnlock,
       CkbBurn,
       CkbMint,
+      CollectorCkbMint,
       EosLock,
       EosUnlock,
       EthLock,
       EthUnlock,
+      CollectorEthUnlock,
       KV,
       SignedTx,
       TronLock,
       TronUnlock,
       WithdrawedBridgeFee,
+      AdaLock,
+      AdaUnlock
     ],
     namingStrategy: new SnakeNamingStrategy(),
   });

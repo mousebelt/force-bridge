@@ -10,6 +10,7 @@ export enum ChainType {
   EOS,
   TRON,
   POLKADOT,
+  ADA
 }
 
 export abstract class Asset {
@@ -53,6 +54,7 @@ export abstract class Asset {
       case ChainType.EOS:
       case ChainType.TRON:
       case ChainType.POLKADOT:
+      case ChainType.ADA:
         return true;
     }
   }
@@ -63,6 +65,8 @@ export abstract class Asset {
         if (!asset) throw new Error('minimal amount not configed');
         return asset.minimalBridgeAmount;
       }
+      case ChainType.ADA:
+        return ForceBridgeCore.config.ada.minimalBridgeAmount;
       case ChainType.BTC:
       case ChainType.EOS:
       case ChainType.TRON:
@@ -78,6 +82,11 @@ export abstract class Asset {
         if (!currentAsset) throw new Error('asset not in white list');
         if (direction === 'in') return currentAsset.bridgeFee.in;
         return currentAsset.bridgeFee.out;
+      }
+      case ChainType.ADA: {
+        const adaConfigInfo = ForceBridgeCore.config.ada;
+        if (direction === 'in') return adaConfigInfo.bridgeFee.in;
+        return adaConfigInfo.bridgeFee.out;
       }
       case ChainType.BTC:
       case ChainType.EOS:
@@ -108,6 +117,9 @@ export abstract class Asset {
         if (!asset) throw new Error('asset not in white list');
         return new BigNumber(amount).times(10 ** asset.decimal).toString();
       }
+      case ChainType.ADA:{
+        return new BigNumber(amount).times(ForceBridgeCore.config.ada.multiplier).toString();
+      }
       case ChainType.BTC:
       case ChainType.EOS:
       case ChainType.TRON:
@@ -117,6 +129,19 @@ export abstract class Asset {
   }
   public abstract toBridgeLockscriptArgs(): string;
   public abstract getAddress(): string;
+}
+
+export function getAsset(chain: number, asset: string): Asset {
+  switch (chain) {
+    case ChainType.ETH: {
+      return new EthAsset(asset);
+    }
+    case ChainType.ADA: {
+      return new AdaAsset(asset);
+    }
+    default:
+      throw new Error(`chainType ${ChainType} not supported yet`);
+  }
 }
 
 export class EthAsset extends Asset {
@@ -180,7 +205,7 @@ export class EosAsset extends Asset {
   }
 
   getAddress(): string {
-    return this.address;
+    return this.address;   
   }
 }
 
@@ -188,6 +213,26 @@ export class BtcAsset extends Asset {
   constructor(public address: string, public ownerCellTypeHash: string = '') {
     super();
     this.chainType = ChainType.BTC;
+  }
+
+  toBridgeLockscriptArgs(): string {
+    const params = {
+      owner_cell_type_hash: fromHexString(this.ownerCellTypeHash).buffer,
+      chain: this.chainType,
+      asset: fromHexString(toHexString(stringToUint8Array(this.address))).buffer,
+    };
+    return `0x${toHexString(new Uint8Array(SerializeForceBridgeLockscriptArgs(params)))}`;
+  }
+
+  getAddress(): string {
+    return this.address;
+  }
+}
+
+export class AdaAsset extends Asset {
+  constructor(public address: string, public ownerCellTypeHash: string = '') {
+    super();
+    this.chainType = ChainType.ADA;
   }
 
   toBridgeLockscriptArgs(): string {

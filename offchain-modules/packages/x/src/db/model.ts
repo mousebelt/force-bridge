@@ -6,6 +6,9 @@ import { CkbMint, CkbMintStatus, dbTxStatus } from './entity/CkbMint';
 import { EosUnlock } from './entity/EosUnlock';
 import { EthLock, TxConfirmStatus } from './entity/EthLock';
 import { EthUnlock, EthUnlockStatus } from './entity/EthUnlock';
+import { AdaLock, AdaTxConfirmStatus } from './entity/AdaLock';
+import { AdaUnlockStatus, AdaUnlock } from './entity/AdaUnlock';
+
 
 export { EthUnlock } from './entity/EthUnlock';
 export { EthLock, TxConfirmStatus } from './entity/EthLock';
@@ -17,6 +20,8 @@ export { CkbMint } from './entity/CkbMint';
 export { CkbBurn } from './entity/CkbBurn';
 export { TronLock } from './entity/TronLock';
 export { TronUnlock } from './entity/TronUnlock';
+export { AdaLock, AdaTxConfirmStatus } from './entity/AdaLock';
+export { AdaUnlockStatus, AdaUnlock } from './entity/AdaUnlock';
 
 export interface ISigned {
   sigType: SigType;
@@ -65,6 +70,22 @@ export interface IEthLock {
   sudtExtraData?: string;
   blockNumber: number;
   blockHash: string;
+  uniqueId: string;
+  confirmNumber?: number;
+  confirmStatus?: TxConfirmStatus;
+}
+
+export interface IAdaLock {
+  txId: string;
+  sender: string;
+  amount: string;
+  bridgeFee: string;
+  recipient: string;
+  sudtExtraData?: string;
+  data?: string;
+  direction: string;
+  status?: AdaTxConfirmStatus;
+  confirmNumber?: number;
 }
 
 export interface ICkbBurn {
@@ -76,6 +97,7 @@ export interface ICkbBurn {
   bridgeFee: string;
   recipientAddress: string;
   blockNumber: number;
+  confirmNumber: number;
   confirmStatus: TxConfirmStatus;
 }
 
@@ -87,6 +109,18 @@ export interface IEthUnlock {
   blockNumber?: number;
   ethTxHash?: string;
   status?: EthUnlockStatus;
+  message?: string;
+}
+
+export interface IAdaUnlock {
+  ckbTxHash: string;
+  chain: number;
+  asset: string;
+  amount: string;
+  recipientAddress: string;
+  blockNumber?: number;
+  adaTxId?: string;
+  status?: AdaUnlockStatus;
   message?: string;
 }
 
@@ -109,7 +143,7 @@ export interface ITronUnlock {
   recipientAddress: string;
 }
 
-export type XchainUnlock = EthUnlock | BtcUnlock | EosUnlock;
+export type XchainUnlock = EthUnlock | BtcUnlock | EosUnlock | AdaUnlock;
 
 // export async function transformBurnEvent(burn: CkbBurn): Promise<XchainUnlock> {
 //   throw new Error('Method not implemented.');
@@ -133,6 +167,19 @@ export function EthLock2CkbMint(record: EthLock): CkbMint {
     chain: ChainType.ETH,
     amount: record.amount,
     asset: record.token,
+    recipientLockscript: record.recipient,
+    sudtExtraData: record.sudtExtraData,
+  });
+}
+
+
+export function AdaLock2CkbMint(record: AdaLock): CkbMint {
+  const ckbMintRepo = getRepository(CkbMint);
+  return ckbMintRepo.create({
+    id: record.txid,
+    chain: ChainType.ADA,
+    amount: record.amount,
+    asset: 'ada',
     recipientLockscript: record.recipient,
     sudtExtraData: record.sudtExtraData,
   });
@@ -223,9 +270,16 @@ export interface UnlockRecord {
   bridge_fee: string;
 }
 
+export interface MintedRecord {
+  amount: bigint;
+  id: string;
+  lockTxHash: string;
+  lockBlockHeight: number;
+}
+
 export interface MintedRecords {
   txHash: string;
-  records: { amount: bigint; lockTxHash: string }[];
+  records: MintedRecord[];
 }
 
 export interface IQuery {

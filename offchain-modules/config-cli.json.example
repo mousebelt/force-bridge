@@ -81,6 +81,27 @@
         "permissionId": 2
       },
       "feeLimit": 1000000
-    }
+    },
+    "ada":{
+      "clientParams": {
+            "host": "34.230.223.133",
+            "user": "test",
+            "pass": "test",
+            "port": 8090,
+            "timeout": 10000
+        },
+        "wallet":{
+          "name":"test-wallet",
+          "mnemonic_sentence":"use merge wasp fossil faint useless party inhale warrior sister duck lesson rescue kind across",
+          "passphrase":"test-wallet",
+          "public_key":"452afe41ec60ed8162de702e84d92dd199dc406b"
+        },
+        "lockAddress": "addr_test1qrdktr9jhzpdnhsh6sf05wru6q62yaxvy39zctrhdf0aajtwyt90x6e8kl4tgh8fxy0m8zywc0vfj99lc2vrc8t70cts28slal",
+        "confirmNumber": 15,
+        "user":{
+          "name":"test wallet",
+          "mnemonic_sentence":"hip dust material keen buddy fresh thank program stool ill regret honey multiply venture imitate",
+          "passphrase":"passphrase",
+        }
   }
 }

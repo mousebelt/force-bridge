@@ -1,20 +1,17 @@
-import { parseAddress } from '@ckb-lumos/helpers';
-import { Reader } from 'ckb-js-toolkit';
-import { BigNumber, ethers } from 'ethers';
+import { BigNumber } from 'ethers';
 import { ChainType, EthAsset } from '../ckb/model/asset';
 import { forceBridgeRole } from '../config';
 import { ForceBridgeCore } from '../core';
 import { EthDb, KVDb, BridgeFeeDB } from '../db';
 import { EthUnlockStatus } from '../db/entity/EthUnlock';
 import { EthUnlock, IEthUnlock } from '../db/model';
-import { nonNullable } from '../errors';
-import { BridgeMetricSingleton, txTokenInfo } from '../monitor/bridge-metric';
-import { ethCollectSignaturesPayload } from '../multisig/multisig-mgr';
+import { asserts, nonNullable } from '../errors';
+import { BridgeMetricSingleton, txTokenInfo } from '../metric/bridge-metric';
 import { asyncSleep, foreverPromise, fromHexString, retryPromise, uint8ArrayToString } from '../utils';
 import { logger } from '../utils/logger';
 import { EthChain, WithdrawBridgeFeeTopic, Log, ParsedLog } from '../xchain/eth';
+import { checkLock } from '../xchain/eth/check';
 
-const MAX_RETRY_TIMES = 3;
 const lastHandleEthBlockKey = 'lastHandleEthBlock';
 
 export interface ParsedLockLog {
@@ -26,12 +23,14 @@ export interface ParsedLockLog {
   sudtExtraData: string;
   blockNumber: number;
   blockHash: string;
+  logIndex: number;
   asset: EthAsset;
 }
 
 export class EthHandler {
   private lastHandledBlockHeight: number;
   private lastHandledBlockHash: string;
+  private startTipBlockHeight: number;
 
   constructor(
     private ethDb: EthDb,
@@ -40,6 +39,18 @@ export class EthHandler {
     private ethChain: EthChain,
     private role: forceBridgeRole,
   ) {}
+
+  async setStartTipBlockHeight(): Promise<void> {
+    this.startTipBlockHeight = (await this.getTipBlock()).height;
+  }
+
+  syncedToStartTipBlockHeight(): boolean {
+    return (
+      Boolean(this.lastHandledBlockHeight) &&
+      Boolean(this.startTipBlockHeight) &&
+      this.lastHandledBlockHeight > this.startTipBlockHeight
+    );
+  }
 
   async getLastHandledBlock(): Promise<{ blockNumber: number; blockHash: string }> {
     const lastHandledBlock = await this.kvDb.get(lastHandleEthBlockKey);
@@ -85,324 +96,157 @@ export class EthHandler {
     logger.info(
       `EthHandler init lastHandledBlock:${this.lastHandledBlockHeight} currentBlockHeight: ${currentBlockHeight}`,
     );
-
-    if (this.lastHandledBlockHeight === currentBlockHeight) {
-      return;
-    }
-
-    const getLogBatchSize = 100;
-    const confirmNumber = ForceBridgeCore.config.eth.confirmNumber;
-    const nextBlock = await this.ethChain.getBlock(this.lastHandledBlockHeight + 1);
-    if (this.isForked(confirmNumber, nextBlock)) {
-      BridgeMetricSingleton.getInstance(this.role).setForkEventHeightMetrics('eth', this.lastHandledBlockHeight);
-      logger.warn(
-        `EthHandler init nextBlock blockHeight:${nextBlock.number} parentHash:${
-          nextBlock.parentHash
-        } != lastHandledBlockHash:${this.lastHandledBlockHash} fork occur removeUnconfirmedLock events from:${
-          nextBlock.number - confirmNumber
-        }`,
-      );
-      const confirmedBlockHeight = nextBlock.number - confirmNumber;
-      const confirmedBlock = await this.ethChain.getBlock(confirmedBlockHeight);
-      await this.ethDb.removeUnconfirmedLocks(confirmedBlockHeight);
-      await this.feeDb.removeForkedWithdrawFee(confirmedBlockHeight);
-      if (this.role !== 'collector') await this.ethDb.removeUnconfirmedUnlocks(confirmedBlockHeight);
-      await this.setLastHandledBlock(confirmedBlockHeight, confirmedBlock.hash);
-    }
-
-    for (;;) {
-      const endBlockNumber =
-        this.lastHandledBlockHeight + getLogBatchSize > currentBlockHeight
-          ? currentBlockHeight
-          : this.lastHandledBlockHeight + getLogBatchSize;
-
-      logger.info(`EthHandler init getLogs from:${this.lastHandledBlockHeight} to:${endBlockNumber}`);
-
-      const lockLogs = await this.ethChain.getLockLogs(this.lastHandledBlockHeight + 1, endBlockNumber);
-      for (const log of lockLogs) {
-        await this.onLockLogs(log.log, log.parsedLog);
-      }
-
-      const UnlockLogs = await this.ethChain.getUnlockLogs(this.lastHandledBlockHeight + 1, endBlockNumber);
-      for (const log of UnlockLogs) {
-        await this.onUnlockLogs(log.log, log.parsedLog);
-      }
-
-      const endBlock = await this.ethChain.getBlock(endBlockNumber);
-      await this.confirmEthLocks(endBlockNumber, confirmNumber);
-      await this.setLastHandledBlock(endBlockNumber, endBlock.hash);
-      if (endBlockNumber == currentBlockHeight) {
-        break;
-      }
-    }
   }
 
-  watchNewBlock(): void {
-    void (async () => {
-      await this.init();
-      this.ethChain.watchNewBlock(this.lastHandledBlockHeight, async (newBlock: ethers.providers.Block) => {
-        await retryPromise(
-          async () => {
-            await this.onBlock(newBlock);
-            const currentBlockHeight = await this.ethChain.getCurrentBlockNumber();
-            BridgeMetricSingleton.getInstance(this.role).setBlockHeightMetrics(
-              'eth',
-              newBlock.number,
-              currentBlockHeight,
-            );
-          },
-          {
-            onRejectedInterval: 3000,
-            maxRetryTimes: MAX_RETRY_TIMES,
-            onRejected: (e: Error) => {
-              logger.error(`Eth watchNewBlock blockHeight:${newBlock} error:${e.message}`);
-            },
-          },
+  async watchNewBlock(): Promise<void> {
+    // set lastHandledBlock
+    await this.init();
+    await this.setStartTipBlockHeight();
+    const maxBatchSize = 5000;
+    let currentHeight: number | null = null;
+    foreverPromise(
+      async () => {
+        let block = await this.ethChain.getBlock('latest');
+        currentHeight = block.number;
+        logger.info(`currentHeight: ${currentHeight}, lastHandledBlock: ${this.lastHandledBlockHeight}`);
+        if (currentHeight - this.lastHandledBlockHeight < 1) {
+          // already handled, wait for new block
+          await asyncSleep(15000);
+          return;
+        }
+        const confirmBlockNumber = this.lastHandledBlockHeight - ForceBridgeCore.config.eth.confirmNumber;
+        const startBlockNumber = (confirmBlockNumber < 0 ? 0 : confirmBlockNumber) + 1;
+
+        let endBlockNumber = currentHeight;
+        if (currentHeight - this.lastHandledBlockHeight > maxBatchSize) {
+          endBlockNumber = this.lastHandledBlockHeight + maxBatchSize;
+          block = await this.ethChain.getBlock(endBlockNumber);
+        }
+        asserts(startBlockNumber <= endBlockNumber);
+        const logs = await this.ethChain.getLogs(startBlockNumber, endBlockNumber);
+        logger.info(
+          `EthHandler onBlock handle logs from ${startBlockNumber} to ${endBlockNumber}, logs: ${JSON.stringify(logs)}`,
         );
-      });
-    })();
-  }
-
-  isForked(confirmNumber: number, block: ethers.providers.Block): boolean {
-    return (
-      confirmNumber !== 0 &&
-      this.lastHandledBlockHeight === block.number - 1 &&
-      this.lastHandledBlockHash !== '' &&
-      block.parentHash !== this.lastHandledBlockHash
+        for (const log of logs) {
+          await this.handleLog(log, currentHeight);
+        }
+        await this.setLastHandledBlock(block.number, block.hash);
+        BridgeMetricSingleton.getInstance(this.role).setBlockHeightMetrics('eth', endBlockNumber, block.number);
+        logger.info(`EthHandler onBlock blockHeight:${block.number} blockHash:${block.hash}`);
+      },
+      {
+        onRejectedInterval: 15000,
+        onResolvedInterval: 0,
+        onRejected: (e: Error) => {
+          logger.warn(`Eth watchNewBlock blockHeight:${currentHeight} error:${e.stack}`);
+        },
+      },
     );
   }
 
-  async onBlock(block: ethers.providers.Block): Promise<void> {
-    const confirmNumber = ForceBridgeCore.config.eth.confirmNumber;
-    if (this.isForked(confirmNumber, block)) {
-      BridgeMetricSingleton.getInstance(this.role).setForkEventHeightMetrics('eth', this.lastHandledBlockHeight);
-      logger.warn(
-        `EthHandler onBlock blockHeight:${block.number} parentHash:${block.parentHash} != lastHandledBlockHash:${
-          this.lastHandledBlockHash
-        } fork occur removeUnconfirmedLock events from:${block.number - confirmNumber}`,
+  async handleLog(log: Log, currentHeight: number): Promise<void> {
+    const parsedLog = await this.ethChain.iface.parseLog(log);
+    if (parsedLog.name === 'Locked') {
+      await this.onLockLogs(log, parsedLog, currentHeight);
+    } else if (parsedLog.name === 'Unlocked') {
+      await this.onUnlockLogs(log, parsedLog);
+    } else {
+      logger.info(`not handled log type ${parsedLog.name}, log: ${JSON.stringify(log)}`);
+    }
+  }
+
+  async onLockLogs(log: Log, parsedLog: ParsedLog, currentHeight: number): Promise<void> {
+    const parsedLockLog = parseLockLog(log, parsedLog);
+    const { amount, asset, token, sudtExtraData, sender, txHash, recipient, blockNumber, blockHash, logIndex } =
+      parsedLockLog;
+    const uniqueId = `${txHash}-${logIndex}`;
+    const records = await this.ethDb.getEthLocksByUniqueIds([uniqueId]);
+    if (records.length > 1) {
+      logger.error('unexpected db find error', records);
+      throw new Error(`unexpected db find error, records.length = ${records.length}`);
+    }
+    const confirmedNumber = currentHeight - log.blockNumber;
+    const confirmed = confirmedNumber >= ForceBridgeCore.config.eth.confirmNumber;
+    const confirmStatus = confirmed ? 'confirmed' : 'unconfirmed';
+    // create new EthLock record
+    if (records.length === 0) {
+      logger.info(
+        `EthHandler watchLockEvents receiveLog blockHeight:${blockNumber} blockHash:${log.blockHash} txHash:${
+          log.transactionHash
+        } amount:${parsedLog.args.lockedAmount.toString()} asset:${parsedLog.args.token} recipientLockscript:${
+          parsedLog.args.recipientLockscript
+        } sudtExtraData:${parsedLog.args.sudtExtraData} sender:${
+          parsedLog.args.sender
+        }, confirmedNumber: ${confirmedNumber}, confirmed: ${confirmed}`,
       );
-      const confirmedBlockHeight = block.number - confirmNumber;
-      await this.ethDb.removeUnconfirmedLocks(confirmedBlockHeight);
-      await this.feeDb.removeForkedWithdrawFee(confirmedBlockHeight);
-      if (this.role !== 'collector') await this.ethDb.removeUnconfirmedUnlocks(confirmedBlockHeight);
-
-      const lockLogs = await this.ethChain.getLockLogs(confirmedBlockHeight + 1, block.number);
-      if (
-        await this.ethChain.isLogForked(
-          lockLogs.map((log) => {
-            return log.log;
-          }),
-        )
-      ) {
-        throw new Error(`lock log fork occured when reorg block ${block.number}`);
-      }
-      for (const log of lockLogs) {
-        await this.onLockLogs(log.log, log.parsedLog);
-      }
-
-      const unlockLogs = await this.ethChain.getUnlockLogs(confirmedBlockHeight + 1, block.number);
-      if (
-        await this.ethChain.isLogForked(
-          unlockLogs.map((log) => {
-            return log.log;
-          }),
-        )
-      ) {
-        throw new Error(`unlock log fork occured when reorg block ${block.number}`);
-      }
-      for (const log of unlockLogs) {
-        await this.onUnlockLogs(log.log, log.parsedLog);
-      }
-    }
-
-    // onLockLogs
-    const lockLogs = await this.ethChain.getLockLogsByBlockHash(block.hash);
-    for (const log of lockLogs) {
-      await this.onLockLogs(log.log, log.parsedLog);
-    }
-
-    // onUnlockLogs
-    const unlockLogs = await this.ethChain.getUnlockLogsByBlockHash(block.hash);
-    for (const log of unlockLogs) {
-      await this.onUnlockLogs(log.log, log.parsedLog);
-    }
-
-    await this.confirmEthLocks(block.number, confirmNumber);
-    await this.setLastHandledBlock(block.number, block.hash);
-    logger.info(`EthHandler onBlock blockHeight:${block.number} blockHash:${block.hash}`);
-  }
-
-  async confirmEthLocks(currentBlockHeight: number, confirmNumber: number): Promise<void> {
-    const confirmedBlockHeight = currentBlockHeight - confirmNumber;
-    const unConfirmedLocks = await this.ethDb.getUnconfirmedLocks();
-    if (unConfirmedLocks.length === 0) {
-      return;
-    }
-
-    const updateConfirmNumberRecords = unConfirmedLocks
-      .filter((record) => record.blockNumber > confirmedBlockHeight)
-      .map((record) => {
-        return { txHash: record.txHash, confirmedNumber: currentBlockHeight - record.blockNumber };
-      });
-    if (updateConfirmNumberRecords.length !== 0) {
-      await this.ethDb.updateLockConfirmNumber(updateConfirmNumberRecords);
-    }
-
-    const confirmedRecords = unConfirmedLocks.filter((record) => record.blockNumber <= confirmedBlockHeight);
-    if (confirmedRecords.length === 0) {
-      return;
-    }
-    const confirmedTxHashes = confirmedRecords.map((lock) => {
-      return lock.txHash;
-    });
-
-    logger.info(`EhtHandler confirmEthLocks updateLockConfirmStatus txHashes:${confirmedTxHashes.join(', ')}`);
-    await this.ethDb.updateLockConfirmStatus(confirmedTxHashes);
-
-    if (this.role === 'collector') {
-      const mintRecords = confirmedRecords.map((lockRecord) => {
-        if (BigInt(lockRecord.amount) <= BigInt(lockRecord.bridgeFee))
-          throw new Error('Unexpected error: lock amount less than bridge fee');
-        return {
-          id: lockRecord.txHash,
-          lockBlockHeight: lockRecord.blockNumber,
-          chain: ChainType.ETH,
-          amount: (BigInt(lockRecord.amount) - BigInt(lockRecord.bridgeFee)).toString(),
-          asset: lockRecord.token,
-          recipientLockscript: lockRecord.recipient,
-          sudtExtraData: lockRecord.sudtExtraData,
-        };
-      });
-      await this.ethDb.createCkbMint(mintRecords);
-      mintRecords.forEach((mintRecord) => {
-        logger.info(
-          `EthHandler onBlock blockHeight:${currentBlockHeight} save CkbMint successful for eth tx ${mintRecord.id}.`,
+      logger.debug('EthHandler watchLockEvents eth lockEvtLog:', { log, parsedLog });
+      if (sudtExtraData.length >= 10240 || recipient.length >= 10240) {
+        logger.warn(
+          `skip createEthLock for record ${JSON.stringify(
+            parsedLog,
+          )}, reason: recipient or sudtExtraData too long to fit in database`,
         );
-      });
+        return;
+      }
+      await this.ethDb.createEthLock([
+        {
+          txHash,
+          amount,
+          token,
+          recipient,
+          sudtExtraData,
+          blockNumber,
+          blockHash,
+          sender,
+          uniqueId,
+          bridgeFee: '0',
+          confirmNumber: confirmedNumber,
+          confirmStatus,
+        },
+      ]);
+      BridgeMetricSingleton.getInstance(this.role).addBridgeTxMetrics('eth_lock', 'success');
+      BridgeMetricSingleton.getInstance(this.role).addBridgeTokenMetrics('eth_lock', [
+        {
+          amount: Number(amount),
+          token: token,
+        },
+      ]);
+      await this.ethDb.updateBridgeInRecord(uniqueId, amount, token, recipient, sudtExtraData);
+      logger.info(`EthHandler watchLockEvents save EthLock successful for eth tx ${log.transactionHash}.`);
     }
-  }
-
-  async parseLockLog(log: Log, parsedLog: ParsedLog): Promise<ParsedLockLog> {
-    const txHash = log.transactionHash;
-    const { token, sudtExtraData, sender } = parsedLog.args;
-    const amount = parsedLog.args.lockedAmount.toString();
-    const asset = new EthAsset(parsedLog.args.token);
-    const recipient = uint8ArrayToString(fromHexString(parsedLog.args.recipientLockscript));
-    return {
-      txHash: txHash,
-      amount: amount,
-      token: token,
-      recipient: recipient,
-      sudtExtraData: sudtExtraData,
-      blockNumber: log.blockNumber,
-      blockHash: log.blockHash,
-      sender: sender,
-      asset,
-    };
-  }
-  // filter lock log, return empty string if it passes, otherwise return the reason why it fails
-  async filterLockLog(parsedLockLog: ParsedLockLog): Promise<string> {
-    const { amount, asset, token, recipient, sudtExtraData } = parsedLockLog;
-    if (!asset.inWhiteList()) {
-      return `EthAsset ${token} not in while list`;
+    if (records.length === 1) {
+      await this.ethDb.updateLockConfirmNumber([{ uniqueId, confirmedNumber, confirmStatus }]);
+      logger.info(`update lock record ${txHash} status, confirmed number: ${confirmedNumber}, status: ${confirmed}`);
     }
-    const minimalAmount = asset.getMinimalAmount();
-    if (BigInt(amount) < BigInt(minimalAmount)) {
-      return `asset amount less than minimal amount ${minimalAmount}`;
-    }
-    // check sudtSize
-    try {
-      const recipientLockscript = parseAddress(recipient);
-      const recipientLockscriptLen = new Reader(recipientLockscript.args).length() + 33;
-      const sudtExtraDataLen = sudtExtraData.length / 2 - 1;
-      // - capacity size: 8
-      // - sudt typescript size
-      //    - code_hash: 32
-      //    - hash_type: 1
-      //    - args: 32
-      // - sude amount size: 16
-      const sudtSizeLimit = ForceBridgeCore.config.ckb.sudtSize;
-      const actualSudtSize = recipientLockscriptLen + sudtExtraDataLen + 89;
-      logger.debug(
-        `check sudtSize: ${JSON.stringify({
-          parsedLockLog,
-          sudtSizeLimit,
-          actualSudtSize,
-          recipientLockscriptLen,
-          sudtExtraDataLen,
-        })}`,
+    if (confirmed && this.role === 'collector') {
+      const filterReason = checkLock(
+        parsedLockLog.amount,
+        parsedLockLog.token,
+        parsedLockLog.recipient,
+        parsedLockLog.sudtExtraData,
       );
-      if (actualSudtSize > sudtSizeLimit) {
-        return `sudt size exceeds limit: ${JSON.stringify({ sudtSizeLimit, actualSudtSize })}`;
+      if (filterReason !== '') {
+        logger.warn(`skip createCkbMint for record ${JSON.stringify(parsedLog)}, reason: ${filterReason}`);
+        return;
       }
-    } catch (e) {
-      return 'invalid recipient address';
-    }
-    return '';
-  }
-
-  async onLockLogs(log: Log, parsedLog: ParsedLog): Promise<void> {
-    for (let i = 1; i <= MAX_RETRY_TIMES; i++) {
-      try {
-        const parsedLockLog = await this.parseLockLog(log, parsedLog);
-        const { amount, asset, token, sudtExtraData, sender, txHash, recipient, blockNumber, blockHash } =
-          parsedLockLog;
-        logger.info(
-          `EthHandler watchLockEvents receiveLog blockHeight:${log.blockNumber} blockHash:${log.blockHash} txHash:${
-            log.transactionHash
-          } amount:${parsedLog.args.lockedAmount.toString()} asset:${parsedLog.args.token} recipientLockscript:${
-            parsedLog.args.recipientLockscript
-          } sudtExtraData:${parsedLog.args.sudtExtraData} sender:${parsedLog.args.sender}`,
-        );
-        logger.debug('EthHandler watchLockEvents eth lockEvtLog:', { log, parsedLog });
-        const filterReason = await this.filterLockLog(parsedLockLog);
-        if (filterReason !== '') {
-          logger.warn(`skip record ${JSON.stringify(parsedLog)}, reason: ${filterReason}`);
-          return;
-        }
-
-        const bridgeFee = this.role === 'collector' ? asset.getBridgeFee('in') : '0';
-        await this.ethDb.createEthLock([
-          {
-            txHash: txHash,
-            amount: amount,
-            bridgeFee: bridgeFee,
-            token: token,
-            recipient: recipient,
-            sudtExtraData: sudtExtraData,
-            blockNumber,
-            blockHash,
-            sender: sender,
-          },
-        ]);
-        BridgeMetricSingleton.getInstance(this.role).addBridgeTxMetrics('eth_lock', 'success');
-        BridgeMetricSingleton.getInstance(this.role).addBridgeTokenMetrics('eth_lock', [
-          {
-            amount: Number(amount),
-            token: token,
-          },
-        ]);
-        logger.info(`EthHandler watchLockEvents save EthLock successful for eth tx ${log.transactionHash}.`);
-        if (this.role !== 'collector') {
-          await this.ethDb.updateBridgeInRecord(txHash, amount, token, recipient, sudtExtraData);
-          logger.info(
-            `Watcher update bridge in record successful while handle lock log for eth tx ${log.transactionHash}.`,
-          );
-        }
-        break;
-      } catch (e) {
-        logger.error(`EthHandler watchLockEvents error: ${e}`);
-        if (i == MAX_RETRY_TIMES) {
-          throw e;
-        }
-        await asyncSleep(3000);
-      }
+      const bridgeFee = asset.getBridgeFee('in');
+      const mintRecords = {
+        id: uniqueId,
+        lockBlockHeight: blockNumber,
+        chain: ChainType.ETH,
+        amount: (BigInt(amount) - BigInt(bridgeFee)).toString(),
+        asset: token,
+        recipientLockscript: recipient,
+        sudtExtraData,
+      };
+      await this.ethDb.createCollectorCkbMint([mintRecords]);
+      logger.info(`save CkbMint successful for eth tx ${txHash}`);
     }
   }
 
   async onUnlockLogs(log: Log, parsedLog: ParsedLog): Promise<void> {
-    for (let i = 1; i <= MAX_RETRY_TIMES; i++) {
-      try {
+    await retryPromise(
+      async () => {
         const amount = parsedLog.args.receivedAmount.toString();
         const { ckbTxHash, recipient, token } = parsedLog.args;
         const unlockTxHash = log.transactionHash;
@@ -423,21 +267,19 @@ export class EthHandler {
           ]);
           return;
         }
+        await this.ethDb.createEthUnlock([
+          {
+            ckbTxHash: ckbTxHash,
+            amount: amount,
+            asset: token,
+            recipientAddress: recipient,
+            blockNumber: log.blockNumber,
+            ethTxHash: unlockTxHash,
+          },
+        ]);
+        await this.ethDb.updateBurnBridgeFee(ckbTxHash, amount);
         if (this.role === 'collector') {
-          await this.ethDb.updateUnlockStatus(log.blockNumber, unlockTxHash, 'success');
-        } else {
-          await this.ethDb.createEthUnlock([
-            {
-              ckbTxHash: ckbTxHash,
-              amount: amount,
-              asset: token,
-              recipientAddress: recipient,
-              blockNumber: log.blockNumber,
-              ethTxHash: unlockTxHash,
-              status: 'success',
-            },
-          ]);
-          await this.ethDb.updateBurnBridgeFee(ckbTxHash, amount);
+          await this.ethDb.updateCollectorUnlockStatus(ckbTxHash, log.blockNumber, 'success');
         }
         BridgeMetricSingleton.getInstance(this.role).addBridgeTokenMetrics('eth_unlock', [
           {
@@ -445,37 +287,26 @@ export class EthHandler {
             token: parsedLog.args.token,
           },
         ]);
-        break;
-      } catch (e) {
-        logger.error(`EthHandler watchUnlockEvents error: ${e}`);
-        if (i == MAX_RETRY_TIMES) {
-          throw e;
-        }
-        await asyncSleep(3000);
-      }
-    }
+      },
+      {
+        onRejected: (e: Error) => {
+          logger.error(`EthHandler onUnlockLogs error:${e.stack}`);
+        },
+      },
+    );
   }
 
-  // // listen ETH chain and handle the new lock events
-  // watchLockEvents(): void {
-  //   this.ethChain.watchLockEvents(this.lastHandledBlockHeight, async (log, parsedLog) => {
-  //     await this.onLockLogs(log, parsedLog);
-  //   });
-  // }
-  //
-  // watchUnlockEvents(): void {
-  //   let unlockHash = '';
-  //   this.ethChain.watchUnlockEvents(this.lastHandledBlockHeight, async (log, parsedLog) => {
-  //     await this.onUnlockLogs(log, parsedLog);
-  //     if (log.transactionHash != unlockHash) {
-  //       unlockHash = log.transactionHash;
-  //       BridgeMetricSingleton.getInstance(this.role).addBridgeTxMetrics('eth_unlock', 'success');
-  //     }
-  //   });
-  // }
-
   async getUnlockRecords(status: EthUnlockStatus): Promise<EthUnlock[]> {
-    return this.ethDb.getEthUnlockRecordsToUnlock(status);
+    const toUnlockRecords = await this.ethDb.getEthUnlockRecordsToUnlock(status);
+    const unlockedRecords = (await this.ethDb.getEthUnlockByCkbTxHashes(toUnlockRecords.map((r) => r.ckbTxHash))).map(
+      (r) => r.ckbTxHash,
+    );
+    if (unlockedRecords.length > 0) {
+      await this.ethDb.setCollectorEthUnlockToSuccess(unlockedRecords);
+      return toUnlockRecords.filter((r) => unlockedRecords.indexOf(r.ckbTxHash) < 0);
+    } else {
+      return toUnlockRecords;
+    }
   }
 
   // watch the eth_unlock table and handle the new unlock events
@@ -484,80 +315,32 @@ export class EthHandler {
     if (this.role !== 'collector') {
       return;
     }
-
-    this.handlePendingUnlockRecords().then(
-      () => {
-        this.handleTodoUnlockRecords();
-      },
-      (err) => {
-        logger.error(`handlePendingUnlockRecords error:${err.stack}`);
-      },
-    );
-  }
-
-  async handlePendingUnlockRecords(): Promise<void> {
-    for (;;) {
-      try {
-        const records = await this.getUnlockRecords('pending');
-        const pendingTx = await this.ethChain.getMultiSigMgr().getPendingTx({ chain: 'eth' });
-        if (pendingTx === undefined && records.length !== 0) {
-          //pendingTx has already completed
-          records.map((record) => {
-            record.status = 'success';
-          });
-          const unlockTxHashes = records.map((record) => {
-            return record.ckbTxHash;
-          });
-          await this.ethDb.saveEthUnlock(records);
-          logger.info(`EthHandler handlePendingUnlockRecords set Record to complete ckbTxHashes:${unlockTxHashes}`);
-          break;
-        }
-        if (records.length !== 0) {
-          await this.doHandleUnlockRecords(records);
-          break;
-        }
-        if (pendingTx !== undefined) {
-          logger.info(`EthHandler handlePendingUnlockRecords pendingTx:${JSON.stringify(pendingTx, undefined, 2)}`);
-          await this.doHandleUnlockRecords(
-            (pendingTx.payload as ethCollectSignaturesPayload).unlockRecords.map((ethUnlock) => {
-              return {
-                ckbTxHash: ethUnlock.ckbTxHash,
-                asset: ethUnlock.token,
-                recipientAddress: ethUnlock.recipient,
-                amount: BigNumber.from(ethUnlock.amount).toString(),
-                ethTxHash: '',
-                status: 'pending',
-                message: '',
-              };
-            }),
-          );
-        }
-        break;
-      } catch (e) {
-        logger.error(`doHandlePendingUnlockRecords error:${e.message} stack:${e.stack}`);
-        await asyncSleep(3000);
-      }
-    }
+    this.handleTodoUnlockRecords();
   }
 
   handleTodoUnlockRecords(): void {
     foreverPromise(
       async () => {
-        await asyncSleep(15000);
+        if (!this.syncedToStartTipBlockHeight()) {
+          logger.info(
+            `wait until syncing to startBlockHeight, lastHandledBlockHeight: ${this.lastHandledBlockHeight}, startTipBlockHeight: ${this.startTipBlockHeight}`,
+          );
+          return;
+        }
         logger.debug('EthHandler watchUnlockEvents get new unlock events and send tx');
         const records = await this.getUnlockRecords('todo');
-        if (records.length === 0 || this.waitForBatch(records)) {
-          logger.info('wait for batch');
+        if (records.length === 0) {
+          logger.info('wait for todo unlock records');
           return;
         }
         logger.info(`EthHandler watchUnlockEvents unlock records: ${JSON.stringify(records)}`);
         await this.doHandleUnlockRecords(records);
       },
       {
-        onRejectedInterval: 0,
-        onResolvedInterval: 0,
+        onRejectedInterval: 15000,
+        onResolvedInterval: 15000,
         onRejected: (e: Error) => {
-          logger.error(`ETH handleTodoUnlockRecords error:${e.message}`);
+          logger.error(`ETH handleTodoUnlockRecords error:${e.stack}`);
         },
       },
     );
@@ -583,7 +366,7 @@ export class EthHandler {
         const gasPrice = await this.ethChain.getGasPrice();
         const gasPriceLimit = BigNumber.from(nonNullable(ForceBridgeCore.config.collector).gasPriceGweiLimit * 10 ** 9);
         logger.debug(`gasPrice ${gasPrice}, gasPriceLimit ${gasPriceLimit}`);
-        if (gasPrice > gasPriceLimit) {
+        if (gasPrice.gt(gasPriceLimit)) {
           const waitSeconds = 30;
           logger.warn(`gasPrice ${gasPrice} exceeds limit ${gasPriceLimit}, waiting for ${waitSeconds}s`);
           await asyncSleep(waitSeconds * 1000);
@@ -593,7 +376,7 @@ export class EthHandler {
         records.map((r) => {
           r.status = 'pending';
         });
-        await this.ethDb.saveEthUnlock(records);
+        await this.ethDb.saveCollectorEthUnlock(records);
         const txRes = await this.ethChain.sendUnlockTxs(records, gasPrice);
         if (typeof txRes === 'boolean') {
           records.map((r) => {
@@ -624,11 +407,13 @@ export class EthHandler {
           r.status = 'pending';
           r.ethTxHash = txRes.hash;
         });
-        await this.ethDb.saveEthUnlock(records);
+        await this.ethDb.saveCollectorEthUnlock(records);
         logger.debug('sendUnlockTxs res', txRes);
-        const receipt = await txRes.wait();
-        logger.info(`EthHandler doHandleUnlockRecords sendUnlockTxs receipt:${JSON.stringify(receipt.logs)}`);
-        if (receipt.status === 1) {
+        try {
+          // wait() will reject if the tx fails
+          // https://docs.ethers.io/v5/api/providers/types/#providers-TransactionResponse
+          const receipt = await txRes.wait();
+          logger.info(`EthHandler doHandleUnlockRecords sendUnlockTxs receipt:${JSON.stringify(receipt.logs)}`);
           records.map((r) => {
             r.status = 'success';
           });
@@ -641,14 +426,14 @@ export class EthHandler {
           });
           BridgeMetricSingleton.getInstance(this.role).addBridgeTokenMetrics('eth_unlock', unlockTokens);
           BridgeMetricSingleton.getInstance(this.role).addBridgeTxMetrics('eth_unlock', 'success');
-        } else {
+        } catch (error) {
           records.map((r) => {
             r.status = 'error';
-            r.message = 'unlock tx failed';
+            r.message = error.toString();
           });
           BridgeMetricSingleton.getInstance(this.role).addBridgeTxMetrics('eth_unlock', 'failed');
           logger.error(
-            `EthHandler doHandleUnlockRecords ckbTxHashes:${unlockTxHashes} unlock execute failed:${receipt}`,
+            `EthHandler doHandleUnlockRecords ckbTxHashes:${unlockTxHashes} unlock execute failed:${error.stack}`,
           );
         }
         break;
@@ -659,7 +444,7 @@ export class EthHandler {
     }
     for (;;) {
       try {
-        await this.ethDb.saveEthUnlock(records);
+        await this.ethDb.saveCollectorEthUnlock(records);
         logger.info(`EthHandler doHandleUnlockRecords process unlock Record completed ckbTxHashes:${unlockTxHashes}`);
         break;
       } catch (e) {
@@ -671,23 +456,30 @@ export class EthHandler {
     }
   }
 
-  waitForBatch(records: EthUnlock[]): boolean {
-    if (ForceBridgeCore.config.common.network === 'testnet') return false;
-    const now = new Date();
-    const maxWaitTime = ForceBridgeCore.config.eth.batchUnlock.maxWaitTime;
-    if (
-      records.find((record) => {
-        return new Date(record.createdAt).getMilliseconds() + maxWaitTime <= now.getMilliseconds();
-      })
-    )
-      return false;
-    return records.length < ForceBridgeCore.config.eth.batchUnlock.batchNumber;
-  }
-
   start(): void {
-    this.watchNewBlock();
+    void this.watchNewBlock();
 
     this.handleUnlockRecords();
     logger.info('eth handler started  🚀');
   }
+}
+
+export function parseLockLog(log: Log, parsedLog: ParsedLog): ParsedLockLog {
+  const txHash = log.transactionHash;
+  const { token, sudtExtraData, sender } = parsedLog.args;
+  const amount = parsedLog.args.lockedAmount.toString();
+  const asset = new EthAsset(parsedLog.args.token);
+  const recipient = uint8ArrayToString(fromHexString(parsedLog.args.recipientLockscript));
+  return {
+    txHash: txHash,
+    amount: amount,
+    token: token,
+    recipient: recipient,
+    sudtExtraData: sudtExtraData,
+    blockNumber: log.blockNumber,
+    blockHash: log.blockHash,
+    logIndex: log.logIndex,
+    sender: sender,
+    asset,
+  };
 }

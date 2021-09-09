@@ -1,13 +1,17 @@
+import fs from 'fs';
 import path from 'path';
+import { ValInfos } from '@force-bridge/cli/src/changeVal';
 import { KeyStore } from '@force-bridge/keystore/dist';
 import { OwnerCellConfig } from '@force-bridge/x/dist/ckb/tx-helper/deploy';
 import { Config, WhiteListEthAsset, CkbDeps } from '@force-bridge/x/dist/config';
 import { asyncSleep, privateKeyToCkbPubkeyHash, writeJsonToFile } from '@force-bridge/x/dist/utils';
 import { logger, initLog } from '@force-bridge/x/dist/utils/logger';
 import * as lodash from 'lodash';
+import * as shelljs from 'shelljs';
 import { execShellCmd, pathFromProjectRoot } from './utils';
 import { deployDev } from './utils/deploy';
 import { ethBatchTest } from './utils/eth_batch_test';
+import { genRandomVerifierConfig } from './utils/generate';
 import { rpcTest } from './utils/rpc-ci';
 
 export interface VerifierConfig {
@@ -51,35 +55,39 @@ async function generateConfig(
   ownerCellConfig: OwnerCellConfig,
   ethContractAddress: string,
   multisigConfig: MultisigConfig,
+  extraMultiSigConfig: MultisigConfig,
   ckbStartHeight: number,
   ethStartHeight: number,
   configPath: string,
   ETH_PRIVATE_KEY: string,
   CKB_PRIVATE_KEY: string,
-  password,
+  password: string,
+  sudtSize = 200,
 ) {
   const baseConfig: Config = lodash.cloneDeep(initConfig);
   logger.debug(`baseConfig: ${JSON.stringify(baseConfig, null, 2)}`);
-  baseConfig.eth.assetWhiteList = assetWhiteList;
   baseConfig.eth.contractAddress = ethContractAddress;
-  baseConfig.eth.multiSignThreshold = multisigConfig.threshold;
-  baseConfig.eth.multiSignAddresses = multisigConfig.verifiers.map((v) => v.ethAddress);
   baseConfig.ckb.deps = ckbDeps;
-  baseConfig.ckb.multisigScript = {
-    R: 0,
-    M: multisigConfig.threshold,
-    publicKeyHashes: multisigConfig.verifiers.map((v) => v.ckbPubkeyHash),
-  };
   baseConfig.ckb.ownerCellTypescript = ownerCellConfig.ownerCellTypescript;
-  baseConfig.ckb.multisigLockscript = ownerCellConfig.multisigLockscript;
   baseConfig.ckb.startBlockHeight = ckbStartHeight;
   baseConfig.eth.startBlockHeight = ethStartHeight;
   // collector
   const collectorConfig: Config = lodash.cloneDeep(baseConfig);
   collectorConfig.common.role = 'collector';
-  collectorConfig.common.orm.database = 'collector';
+  collectorConfig.common.orm!.database = 'collector';
   collectorConfig.common.port = 8090;
   collectorConfig.common.collectorPubKeyHash.push(privateKeyToCkbPubkeyHash(CKB_PRIVATE_KEY));
+  collectorConfig.eth.privateKey = 'eth';
+  collectorConfig.ckb.privateKey = 'ckb';
+  collectorConfig.eth.multiSignThreshold = multisigConfig.threshold;
+  collectorConfig.eth.multiSignAddresses = multisigConfig.verifiers.map((v) => v.ethAddress);
+  collectorConfig.eth.assetWhiteList = assetWhiteList;
+  collectorConfig.ckb.sudtSize = sudtSize;
+  collectorConfig.ckb.multisigScript = {
+    R: 0,
+    M: multisigConfig.threshold,
+    publicKeyHashes: multisigConfig.verifiers.map((v) => v.ckbPubkeyHash),
+  };
   collectorConfig.collector = {
     gasLimit: 250000,
     batchGasLimit: 100000,
@@ -112,26 +120,19 @@ async function generateConfig(
   // watcher
   const watcherConfig: Config = lodash.cloneDeep(baseConfig);
   watcherConfig.common.role = 'watcher';
-  watcherConfig.common.orm.database = 'watcher';
+  watcherConfig.common.orm!.database = 'watcher';
   watcherConfig.common.log.logFile = path.join(configPath, 'watcher/force_bridge.log');
   watcherConfig.common.log.identity = 'watcher';
   watcherConfig.common.port = 8080;
-  watcherConfig.common.keystorePath = path.join(configPath, 'watcher/keystore.json');
-  const watcherStore = KeyStore.createFromPairs(
-    {
-      ckb: CKB_PRIVATE_KEY,
-      eth: ETH_PRIVATE_KEY,
-    },
-    password,
-  ).getEncryptedData();
-  writeJsonToFile(watcherStore, watcherConfig.common.keystorePath);
+  watcherConfig.eth.assetWhiteList = assetWhiteList;
+  watcherConfig.ckb.sudtSize = sudtSize;
   writeJsonToFile({ forceBridge: watcherConfig }, path.join(configPath, 'watcher/force_bridge.json'));
   // verifiers
-  multisigConfig.verifiers.map((v, i) => {
+  multisigConfig.verifiers.concat(extraMultiSigConfig.verifiers).map((v, i) => {
     const verifierIndex = i + 1;
     const verifierConfig: Config = lodash.cloneDeep(baseConfig);
     verifierConfig.common.role = 'verifier';
-    verifierConfig.common.orm.database = `verifier${verifierIndex}`;
+    verifierConfig.common.orm!.database = `verifier${verifierIndex}`;
     verifierConfig.eth.privateKey = 'verifier';
     verifierConfig.ckb.privateKey = 'verifier';
     verifierConfig.common.port = 8000 + verifierIndex;
@@ -154,7 +155,7 @@ async function generateConfig(
   // docker compose file
 }
 
-async function startService(
+async function startVerifierService(
   FORCE_BRIDGE_KEYSTORE_PASSWORD: string,
   forcecli: string,
   configPath: string,
@@ -167,16 +168,108 @@ async function startService(
     );
   }
   await execShellCmd(
-    `FORCE_BRIDGE_KEYSTORE_PASSWORD=${FORCE_BRIDGE_KEYSTORE_PASSWORD} ${forcecli} collector -cfg ${configPath}/collector/force_bridge.json`,
-    false,
-  );
-  await execShellCmd(
     `FORCE_BRIDGE_KEYSTORE_PASSWORD=${FORCE_BRIDGE_KEYSTORE_PASSWORD} ${forcecli} rpc -cfg ${path.join(
       configPath,
       'watcher/force_bridge.json',
     )}`,
     false,
   );
+}
+
+async function startCollectorService(FORCE_BRIDGE_KEYSTORE_PASSWORD: string, forcecli: string, configPath: string) {
+  await execShellCmd(
+    `FORCE_BRIDGE_KEYSTORE_PASSWORD=${FORCE_BRIDGE_KEYSTORE_PASSWORD} ${forcecli} collector -cfg ${configPath}/collector/force_bridge.json`,
+    false,
+  );
+}
+
+async function startChangeVal(
+  forcecli: string,
+  configPath: string,
+  bridgeEthAddress: string,
+  CKB_PRIVKEY: string,
+  ETH_PRIVKEY: string,
+  oldMultiSigner: MultisigConfig,
+  extraMultiSigConfig: MultisigConfig,
+) {
+  const newThreshold = extraMultiSigConfig.threshold;
+  const newMultiSigConfig: VerifierConfig[] = [oldMultiSigner.verifiers[1]].concat(extraMultiSigConfig.verifiers);
+
+  // from old 1/2 to new 3/4. 8002 is on behalf of the old. 8003,8004,8005 are on behalf of the new
+  const sigServerHost: string[] = [
+    'http://127.0.0.1:8002',
+    'http://127.0.0.1:8003',
+    'http://127.0.0.1:8004',
+    'http://127.0.0.1:8005',
+  ];
+  const validatorInfosPath = `${configPath}/change-val/validatorInfos.json`;
+  const changeValRawTxPath = `${configPath}/change-val/changeValidatorRawTx.json`;
+  const changeValTxWithSigDir = `${configPath}/change-val/sig/`;
+  if (!fs.existsSync(changeValTxWithSigDir)) {
+    fs.mkdirSync(changeValTxWithSigDir, { recursive: true });
+  }
+  const valInfos: ValInfos = {
+    ckb: {
+      newThreshold: newThreshold,
+      oldValInfos: {
+        R: 0,
+        M: oldMultiSigner.threshold,
+        publicKeyHashes: oldMultiSigner.verifiers.map((v) => v.ckbPubkeyHash),
+      },
+    },
+    eth: {
+      contractAddr: bridgeEthAddress,
+      newThreshold: newThreshold,
+      oldValidators: oldMultiSigner.verifiers.map((v) => v.ethAddress),
+    },
+    newValRpcURLs: sigServerHost,
+  };
+  writeJsonToFile(valInfos, validatorInfosPath);
+  logger.info(
+    `------ start to change validators from 1/2 to 3/4. save validator info to ${validatorInfosPath} ------ `,
+  );
+  await execShellCmd(
+    `${forcecli} change-val set  --ckbPrivateKey ${CKB_PRIVKEY} --input ${validatorInfosPath} --output ${changeValRawTxPath}`,
+    true,
+  );
+  for (let i = 0; i < oldMultiSigner.verifiers.length; i++) {
+    await execShellCmd(
+      `${forcecli} change-val sign --ckbPrivateKey ${oldMultiSigner.verifiers[i].privkey} --ethPrivateKey ${oldMultiSigner.verifiers[i].privkey}  --input ${changeValRawTxPath} --output ${changeValTxWithSigDir}changeValidatorTxWithSig-${i}.json`,
+      true,
+    );
+  }
+
+  await execShellCmd(
+    `${forcecli} change-val send  --ckbPrivateKey ${CKB_PRIVKEY} --ethPrivateKey ${ETH_PRIVKEY} --input ${changeValTxWithSigDir} --source ${changeValRawTxPath}`,
+    true,
+  );
+  logger.info(`------  change validators from 1/2 to 3/4 successfully -------`);
+  const collectorConfig: { forceBridge: Config } = JSON.parse(
+    fs.readFileSync(path.join(configPath, 'collector/force_bridge.json'), 'utf8').toString(),
+  );
+  collectorConfig.forceBridge.eth.multiSignThreshold = newThreshold;
+  collectorConfig.forceBridge.eth.multiSignAddresses = newMultiSigConfig.map((v) => v.ethAddress);
+  collectorConfig.forceBridge.ckb.multisigScript = {
+    R: 0,
+    M: newThreshold,
+    publicKeyHashes: newMultiSigConfig.map((v) => v.ckbPubkeyHash),
+  };
+
+  collectorConfig.forceBridge.eth.multiSignHosts = newMultiSigConfig.map((v, i) => {
+    return {
+      address: v.ethAddress,
+      host: `http://127.0.0.1:${8002 + i}/force-bridge/sign-server/api/v1`,
+    };
+  });
+  collectorConfig.forceBridge.ckb.multiSignHosts = newMultiSigConfig.map((v, i) => {
+    return {
+      address: v.ckbAddress,
+      host: `http://127.0.0.1:${8002 + i}/force-bridge/sign-server/api/v1`,
+    };
+  });
+
+  writeJsonToFile(collectorConfig, path.join(configPath, 'collector/force_bridge.json'));
+  await asyncSleep(5000);
 }
 
 async function main() {
@@ -190,8 +283,9 @@ async function main() {
   const ETH_TEST_PRIVKEY = '0x719e94ec5d2ecef67b5878503ffd6e1e0e2fe7a52ddd55c436878cb4d52d376d';
   const CKB_TEST_PRIVKEY = '0xa6b8e0cbadda5c0d91cf82d1e8d8120b755aa06bc49030ca6e8392458c65fc80';
 
-  const MULTISIG_NUMBER = 3;
+  const MULTISIG_NUMBER = 2;
   const MULTISIG_THRESHOLD = 2;
+  const EXTRA_MULTISIG_NUMBER = 3;
   const FORCE_BRIDGE_KEYSTORE_PASSWORD = '123456';
   const ETH_RPC_URL = 'http://127.0.0.1:8545';
   const CKB_RPC_URL = 'http://127.0.0.1:8114';
@@ -227,21 +321,14 @@ async function main() {
     },
     eth: {
       rpcUrl: 'http://127.0.0.1:8545',
-      privateKey: 'eth',
       confirmNumber: 1,
       startBlockHeight: 1,
-      batchUnlock: {
-        batchNumber: 100,
-        maxWaitTime: 86400000,
-      },
     },
     ckb: {
       ckbRpcUrl: 'http://127.0.0.1:8114',
       ckbIndexerUrl: 'http://127.0.0.1:8116',
-      privateKey: 'ckb',
       startBlockHeight: 1,
       confirmNumber: 1,
-      sudtSize: 500,
     },
   };
   const { assetWhiteList, ckbDeps, ownerConfig, bridgeEthAddress, multisigConfig, ckbStartHeight, ethStartHeight } =
@@ -253,8 +340,15 @@ async function main() {
       MULTISIG_THRESHOLD,
       ETH_PRIVATE_KEY,
       CKB_PRIVATE_KEY,
+      'DEV',
       path.join(configPath, 'deployConfig.json'),
     );
+
+  const extraMultiSigConfig = {
+    threshold: EXTRA_MULTISIG_NUMBER,
+    verifiers: lodash.range(EXTRA_MULTISIG_NUMBER).map((_i) => genRandomVerifierConfig()),
+  };
+  logger.info(`extra multiSig config ${JSON.stringify(extraMultiSigConfig, null, 2)}`);
   await generateConfig(
     initConfig as unknown as Config,
     assetWhiteList,
@@ -262,6 +356,7 @@ async function main() {
     ownerConfig,
     bridgeEthAddress,
     multisigConfig,
+    extraMultiSigConfig,
     ckbStartHeight,
     ethStartHeight,
     configPath,
@@ -269,13 +364,55 @@ async function main() {
     CKB_PRIVATE_KEY,
     FORCE_BRIDGE_KEYSTORE_PASSWORD,
   );
-  await handleDb('drop', MULTISIG_NUMBER);
-  await handleDb('create', MULTISIG_NUMBER);
-  await startService(FORCE_BRIDGE_KEYSTORE_PASSWORD, forcecli, configPath, MULTISIG_NUMBER);
-  await asyncSleep(30000);
-  await ethBatchTest(ETH_TEST_PRIVKEY, CKB_TEST_PRIVKEY, ETH_RPC_URL, CKB_RPC_URL, CKB_INDEXER_URL, FORCE_BRIDGE_URL);
-  await rpcTest(FORCE_BRIDGE_URL, CKB_RPC_URL, ETH_RPC_URL, CKB_TEST_PRIVKEY, ETH_TEST_PRIVKEY);
+  await handleDb('drop', MULTISIG_NUMBER + EXTRA_MULTISIG_NUMBER);
+  await handleDb('create', MULTISIG_NUMBER + EXTRA_MULTISIG_NUMBER);
+  await startVerifierService(
+    FORCE_BRIDGE_KEYSTORE_PASSWORD,
+    forcecli,
+    configPath,
+    MULTISIG_NUMBER + EXTRA_MULTISIG_NUMBER,
+  );
+  const command = `FORCE_BRIDGE_KEYSTORE_PASSWORD=${FORCE_BRIDGE_KEYSTORE_PASSWORD} ${forcecli} collector -cfg ${configPath}/collector/force_bridge.json`;
+  await asyncSleep(60000);
+  const collectorProcess = shelljs.exec(command, { async: true });
+  await ethBatchTest(
+    ETH_TEST_PRIVKEY,
+    CKB_TEST_PRIVKEY,
+    ETH_RPC_URL,
+    CKB_RPC_URL,
+    CKB_INDEXER_URL,
+    FORCE_BRIDGE_URL,
+    3,
+  );
+  await rpcTest(FORCE_BRIDGE_URL, CKB_RPC_URL, ETH_RPC_URL, CKB_TEST_PRIVKEY, ETH_TEST_PRIVKEY, bridgeEthAddress);
   logger.info('integration test pass!');
+  // only test change validator when the env is set
+  if (!process.env.TEST_CHANGE_VALIDATOR) {
+    return;
+  }
+  collectorProcess.kill();
+  await startChangeVal(
+    forcecli,
+    configPath,
+    bridgeEthAddress,
+    CKB_TEST_PRIVKEY,
+    ETH_TEST_PRIVKEY,
+    multisigConfig,
+    extraMultiSigConfig,
+  );
+  await asyncSleep(60000);
+  await startCollectorService(FORCE_BRIDGE_KEYSTORE_PASSWORD, forcecli, configPath);
+  await ethBatchTest(
+    ETH_TEST_PRIVKEY,
+    CKB_TEST_PRIVKEY,
+    ETH_RPC_URL,
+    CKB_RPC_URL,
+    CKB_INDEXER_URL,
+    FORCE_BRIDGE_URL,
+    3,
+  );
+  await rpcTest(FORCE_BRIDGE_URL, CKB_RPC_URL, ETH_RPC_URL, CKB_TEST_PRIVKEY, ETH_TEST_PRIVKEY, bridgeEthAddress);
+  logger.info('change validator test pass!');
 }
 
 main()
